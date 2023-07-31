@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html>
+<body>
+
+<canvas id="image" width="256" height="256"></canvas>
+<canvas id="canvas" width="256" height="256"></canvas>
+<canvas id="preview" witdh="256" height="256"></canvas>
+<img src="input.png" id="input">
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@latest/dist/ort.min.js"></script>
+<script>
+  window.onload = async function() {
+    const canvas = document.getElementById('image');
+    const ctx = canvas.getContext('2d');
+  
+    // 
+    const img = document.getElementById("input");
+    ctx.drawImage(img, 0, 0, 256, 256); // resize 256x256 for inference
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+}
+</script>
+
+<script>
+function imageDataToTensor(data, dims) {
+    // 1a. Extract the R, G, and B channels from the data to form a 3D int array
+    const [R, G, B] = new Array([], [], []);
+    for (let i = 0; i < data.length; i += 4) {
+      R.push(data[i]);
+      G.push(data[i + 1]);
+      B.push(data[i + 2]);
+      // 2. skip data[i + 3] thus filtering out the alpha channel
+    }
+    ///console.log(R);
+    //console.log(G);
+    //console.log(B);
+    // 1b. concatenate RGB ~= transpose [256, 256, 3] -> [3, 256, 256]
+    const transposedData = R.concat(G).concat(B);
+
+    // 3. convert to float32
+    let i, l = transposedData.length; // length, we need this for the loop
+    const float32Data = new Float32Array(3 * 256 * 256); // create the Float32Array for output
+    for (i = 0; i < l; i++) {
+      float32Data[i] = transposedData[i] / 255.0; // convert to float
+    }
+  
+    const inputTensor = new ort.Tensor("float32", float32Data, dims);
+    return inputTensor;
+  }
+  async function runModel(model, preprocessedData) {
+    const start = new Date();
+    try {
+      const feeds = {};
+      feeds['input'] = preprocessedData;
+      const outputData = await model.run(feeds);
+      const end = new Date();
+      const inferenceTime = (end.getTime() - start.getTime());
+      const output = outputData[model.outputNames[0]];
+      return [output, inferenceTime];
+    } catch (e) {
+      console.error(e);
+      throw new Error();
+    }
+  }
+
+  function countValues(output) {
+    // Convert BigInt64Array to regular array of numbers for processing
+    let data = Array.from(output, Number);
+
+    // Use reduce to count occurrences of each value
+    let counts = data.reduce((acc, val) => {
+        if (!acc[val]) {
+            acc[val] = 0;
+        }
+        acc[val]++;
+        return acc;
+    }, {});
+
+    return counts;
+}
+
+// Convert an HSV color to RGB. 
+// h, s, and v are in [0, 1].
+function hsvToRgb(h, s, v) {
+  var r, g, b, i, f, p, q, t;
+  i = Math.floor(h * 6);
+  f = h * 6 - i;
+  p = v * (1 - s);
+  q = v * (1 - f * s);
+  t = v * (1 - (1 - f) * s);
+  switch (i % 6) {
+    case 0: r = v, g = t, b = p; break;
+    case 1: r = q, g = v, b = p; break;
+    case 2: r = p, g = v, b = t; break;
+    case 3: r = p, g = q, b = v; break;
+    case 4: r = t, g = p, b = v; break;
+    case 5: r = v, g = p, b = q; break;
+  }
+  return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
+}
+
+
+async  function main() {
+    // const canvas = document.getElementById('image');
+    // const ctx = canvas.getContext('2d');
+  
+    // const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const canvas = document.getElementById('image');
+    const ctx = canvas.getContext('2d');
+  
+    // // read the image, write to the canvas
+    const img = document.getElementById("input");
+    ctx.drawImage(img, 0, 0, 256, 256);
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+    const session = await ort.InferenceSession.create('./pid150.onnx');
+    // const session = await ort.InferenceSession.create('./pid150.onnx',  { executionProviders: ['webgl'] });
+
+    var data = imageDataToTensor(imageData.data, [1, 3, 256, 256])
+
+    // console.log(data);    
+    const [results, time] =  await runModel(session, data);
+    let x = results.data;
+  let dims = results.dims;
+  
+  const argmaxData = new Int32Array(dims[2] * dims[3]);
+
+  let stride = [dims[1]*dims[2]*dims[3], dims[2]*dims[3], dims[3], 1];
+    let index = 0;
+
+  for (let i = 0; i < dims[2]; i++) {
+      for (let j = 0; j < dims[3]; j++) {
+          let z = [];
+          for (let k = 0; k < dims[1]; k++) {
+              let idx = stride[1]*k + stride[2]*i + stride[3]*j;
+              z.push(x[idx]);
+          }
+          let maxIdx = z.indexOf(Math.max(...z));
+          argmaxData[index] = maxIdx;
+          index ++;
+          // console.log(maxIdx);
+      }
+  }
+  console.log(countValues(argmaxData));
+    console.log(argmaxData);
+
+// Create a new canvas for displaying the argmax results
+const canvas2 = document.getElementById('preview');
+const ctx2 = canvas2.getContext('2d');
+const imgData2 = ctx2.createImageData(256, 256);
+
+for (let i = 0; i < 32; i++) {
+  for (let j = 0; j < 32; j++) {
+    const idx = argmaxData[i * 32 + j]; // The channel index
+    const color = hsvToRgb(idx / 19, 1, 1); // Convert the index to a color
+
+    for (let x = 0; x < 8; x++) {
+      for (let y = 0; y < 8; y++) {
+        const pixelIndex = ((i * 8 + x) * 256 + (j * 8 + y)) * 4;
+        imgData2.data[pixelIndex] = color[0]; // Red channel
+        imgData2.data[pixelIndex + 1] = color[1]; // Green channel
+        imgData2.data[pixelIndex + 2] = color[2]; // Blue channel
+        imgData2.data[pixelIndex + 3] = 255; // Alpha channel
+      }
+    }
+  }
+}
+
+ctx2.putImageData(imgData2, 0, 0);
+    
+
+}
+
+main();
+
+</script>
+</body>
+</html>
